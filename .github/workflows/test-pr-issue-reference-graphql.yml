@@ -1,0 +1,338 @@
+name: Test GITHUB_TOKEN PR with Issue Reference (GraphQL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to reference in the PR description"
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  test-pr-with-issue-reference:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create a test branch with a change
+        run: |
+          BRANCH_NAME="test/authz-issue-ref-graphql-$(date +%s)"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_ENV"
+
+          git checkout -b "$BRANCH_NAME"
+
+          echo "Test change created at $(date -u)" > test-authz-change.txt
+
+          git add test-authz-change.txt
+          git commit -m "test: add file to verify GITHUB_TOKEN PR creation with issue ref (GraphQL)"
+          git push origin "$BRANCH_NAME"
+
+      - name: Look up repository node ID
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          QUERY=$(cat <<'EOF'
+          query($owner: String!, $name: String!) {
+            repository(owner: $owner, name: $name) {
+              id
+            }
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "$(jq -n \
+              --arg query "$QUERY" \
+              --arg owner "$OWNER" \
+              --arg name "$REPO_NAME" \
+              '{ query: $query, variables: { owner: $owner, name: $name } }')")
+
+          echo "::group::Repository lookup response"
+          echo "$RESPONSE" | jq .
+          echo "::endgroup::"
+
+          REPO_ID=$(echo "$RESPONSE" | jq -r '.data.repository.id')
+
+          if [ -z "$REPO_ID" ] || [ "$REPO_ID" = "null" ]; then
+            echo "❌ Failed to resolve repository node ID"
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+
+          echo "Repository node ID: $REPO_ID"
+          echo "REPO_ID=$REPO_ID" >> "$GITHUB_ENV"
+
+      - name: Create pull request via GraphQL mutation
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ inputs.issue_number }}
+          REPO="${{ github.repository }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          RUN_URL="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}"
+
+          PR_TITLE="Test: GITHUB_TOKEN authz with issue reference #${ISSUE_NUMBER} (GraphQL)"
+
+          # Build the PR body — use literal newlines so no escape interpretation is needed
+          PR_BODY="## Purpose
+
+          This PR was created via the GraphQL API to test the authorization behavior
+          of the \`GITHUB_TOKEN\` when a PR description references an issue.
+
+          ## Referenced Issue
+
+          Related to #${ISSUE_NUMBER}
+
+          This references issue: https://github.com/${REPO}/issues/${ISSUE_NUMBER}
+
+          ## Keyword References (close/fix syntax)
+
+          Closes #${ISSUE_NUMBER}
+
+          ---
+          _Created by GitHub Actions workflow run [#${{ github.run_number }}](${RUN_URL})_"
+
+          # Strip leading whitespace caused by heredoc indentation
+          PR_BODY=$(echo "$PR_BODY" | sed 's/^          //')
+
+          MUTATION=$(cat <<'EOF'
+          mutation($input: CreatePullRequestInput!) {
+            createPullRequest(input: $input) {
+              pullRequest {
+                number
+                url
+                title
+                body
+              }
+            }
+          }
+          EOF
+          )
+
+          # Build the JSON payload — jq --arg safely handles the multiline body
+          PAYLOAD=$(jq -n \
+            --arg query "$MUTATION" \
+            --arg repoId "$REPO_ID" \
+            --arg title "$PR_TITLE" \
+            --arg body "$PR_BODY" \
+            --arg head "$BRANCH_NAME" \
+            --arg base "$DEFAULT_BRANCH" \
+            '{
+              query: $query,
+              variables: {
+                input: {
+                  repositoryId: $repoId,
+                  title: $title,
+                  body: $body,
+                  headRefName: $head,
+                  baseRefName: $base
+                }
+              }
+            }')
+
+          echo "::group::GraphQL request payload"
+          echo "$PAYLOAD" | jq .
+          echo "::endgroup::"
+
+          echo "::group::Creating pull request via GraphQL"
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "$PAYLOAD")
+          echo "::endgroup::"
+
+          echo "$RESPONSE" | jq .
+
+          # Check for GraphQL errors
+          ERRORS=$(echo "$RESPONSE" | jq -r '.errors // empty')
+
+          echo "## Result Summary" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$ERRORS" ]; then
+            echo "❌ GraphQL mutation returned errors:"
+            echo "$ERRORS" | jq .
+            echo "❌ **PR creation failed (GraphQL errors)**" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            echo "$ERRORS" | jq . >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          PR_URL=$(echo "$RESPONSE" | jq -r '.data.createPullRequest.pullRequest.url')
+          PR_NUMBER=$(echo "$RESPONSE" | jq -r '.data.createPullRequest.pullRequest.number')
+
+          if [ -z "$PR_URL" ] || [ "$PR_URL" = "null" ]; then
+            echo "❌ PR creation returned no pull request data"
+            echo "$RESPONSE" | jq .
+            echo "❌ **PR creation failed (no data returned)**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "✅ PR #${PR_NUMBER} created successfully: $PR_URL"
+          echo "PR_URL=$PR_URL" >> "$GITHUB_ENV"
+          echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+          echo "✅ **PR created successfully**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- PR URL: [#${PR_NUMBER}](${PR_URL})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Referenced issue: #${ISSUE_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify issue cross-reference via GraphQL
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ inputs.issue_number }}
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          QUERY=$(cat <<'EOF'
+          query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              issue(number: $number) {
+                title
+                state
+                url
+                timelineItems(first: 50, itemTypes: [CROSS_REFERENCED_EVENT]) {
+                  nodes {
+                    ... on CrossReferencedEvent {
+                      source {
+                        ... on PullRequest {
+                          number
+                          url
+                          title
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          EOF
+          )
+
+          PAYLOAD=$(jq -n \
+            --arg query "$QUERY" \
+            --arg owner "$OWNER" \
+            --arg name "$REPO_NAME" \
+            --argjson number "$ISSUE_NUMBER" \
+            '{ query: $query, variables: { owner: $owner, name: $name, number: $number } }')
+
+          echo "::group::Fetching issue #${ISSUE_NUMBER} and cross-references via GraphQL"
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "$PAYLOAD")
+
+          echo "$RESPONSE" | jq .
+          echo "::endgroup::"
+
+          # Show cross-referenced PRs
+          echo "Cross-referenced pull requests:"
+          echo "$RESPONSE" | jq '.data.repository.issue.timelineItems.nodes[] | .source'
+
+      - name: Verify PR body contains issue references
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ inputs.issue_number }}
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          REPO="${{ github.repository }}"
+
+          QUERY=$(cat <<'EOF'
+          query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                body
+              }
+            }
+          }
+          EOF
+          )
+
+          PAYLOAD=$(jq -n \
+            --arg query "$QUERY" \
+            --arg owner "$OWNER" \
+            --arg name "$REPO_NAME" \
+            --argjson number "$PR_NUMBER" \
+            '{ query: $query, variables: { owner: $owner, name: $name, number: $number } }')
+
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "$PAYLOAD")
+
+          PR_BODY=$(echo "$RESPONSE" | jq -r '.data.repository.pullRequest.body')
+
+          echo "::group::PR body content"
+          echo "$PR_BODY"
+          echo "::endgroup::"
+
+          echo "## PR Body Verification" >> "$GITHUB_STEP_SUMMARY"
+
+          CHECKS_PASSED=0
+          CHECKS_TOTAL=3
+
+          # Check short-form reference
+          if echo "$PR_BODY" | grep -q "#${ISSUE_NUMBER}"; then
+            echo "✅ Short-form reference (#${ISSUE_NUMBER}) found"
+            echo "- ✅ Short-form reference \`#${ISSUE_NUMBER}\`" >> "$GITHUB_STEP_SUMMARY"
+            CHECKS_PASSED=$((CHECKS_PASSED + 1))
+          else
+            echo "❌ Short-form reference (#${ISSUE_NUMBER}) NOT found"
+            echo "- ❌ Short-form reference \`#${ISSUE_NUMBER}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check full URL reference
+          FULL_URL="https://github.com/${REPO}/issues/${ISSUE_NUMBER}"
+          if echo "$PR_BODY" | grep -q "$FULL_URL"; then
+            echo "✅ Full URL reference found"
+            echo "- ✅ Full URL reference" >> "$GITHUB_STEP_SUMMARY"
+            CHECKS_PASSED=$((CHECKS_PASSED + 1))
+          else
+            echo "❌ Full URL reference NOT found"
+            echo "- ❌ Full URL reference" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check closing keyword reference
+          if echo "$PR_BODY" | grep -qi "closes #${ISSUE_NUMBER}"; then
+            echo "✅ Closing keyword reference found"
+            echo "- ✅ Closing keyword reference" >> "$GITHUB_STEP_SUMMARY"
+            CHECKS_PASSED=$((CHECKS_PASSED + 1))
+          else
+            echo "❌ Closing keyword reference NOT found"
+            echo "- ❌ Closing keyword reference" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo ""
+          echo "Checks passed: ${CHECKS_PASSED}/${CHECKS_TOTAL}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Checks passed: ${CHECKS_PASSED}/${CHECKS_TOTAL}**" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CHECKS_PASSED" -ne "$CHECKS_TOTAL" ]; then
+            echo "::warning::Not all reference checks passed"
+          fi
