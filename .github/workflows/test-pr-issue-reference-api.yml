@@ -65,7 +65,7 @@ jobs:
           # Build the JSON payload using jq to handle escaping safely
           PAYLOAD=$(jq -n \
             --arg title "$PR_TITLE" \
-            --arg body "$PR_BODY" \
+            --rawarg body "$PR_BODY" \
             --arg head "$BRANCH_NAME" \
             --arg base "$DEFAULT_BRANCH" \
             '{
