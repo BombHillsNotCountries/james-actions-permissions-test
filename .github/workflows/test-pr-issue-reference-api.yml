@@ -1,0 +1,205 @@
+name: Test GITHUB_TOKEN PR with Issue Reference (API)
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to reference in the PR description"
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  test-pr-with-issue-reference:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create a test branch with a change
+        run: |
+          BRANCH_NAME="test/authz-issue-ref-api-$(date +%s)"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_ENV"
+
+          git checkout -b "$BRANCH_NAME"
+
+          echo "Test change created at $(date -u)" > test-authz-change.txt
+
+          git add test-authz-change.txt
+          git commit -m "test: add file to verify GITHUB_TOKEN PR creation with issue ref (API)"
+          git push origin "$BRANCH_NAME"
+
+      - name: Create pull request via REST API
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ inputs.issue_number }}
+          REPO="${{ github.repository }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          RUN_URL="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}"
+
+          PR_TITLE="Test: GITHUB_TOKEN authz with issue reference #${ISSUE_NUMBER} (API)"
+
+          # Build the PR body with all reference styles
+          PR_BODY="## Purpose\n\n"
+          PR_BODY+="This PR was created via the REST API to test the authorization behavior "
+          PR_BODY+="of the \`GITHUB_TOKEN\` when a PR description references an issue.\n\n"
+          PR_BODY+="## Referenced Issue\n\n"
+          PR_BODY+="Related to #${ISSUE_NUMBER}\n\n"
+          PR_BODY+="This references issue: https://github.com/${REPO}/issues/${ISSUE_NUMBER}\n\n"
+          PR_BODY+="## Keyword References (close/fix syntax)\n\n"
+          PR_BODY+="Closes #${ISSUE_NUMBER}\n\n"
+          PR_BODY+="---\n"
+          PR_BODY+="_Created by GitHub Actions workflow run [#${{ github.run_number }}](${RUN_URL})_"
+
+          # Build the JSON payload using jq to handle escaping safely
+          PAYLOAD=$(jq -n \
+            --arg title "$PR_TITLE" \
+            --arg body "$PR_BODY" \
+            --arg head "$BRANCH_NAME" \
+            --arg base "$DEFAULT_BRANCH" \
+            '{
+              title: $title,
+              body: $body,
+              head: $head,
+              base: $base
+            }')
+
+          echo "::group::Request payload"
+          echo "$PAYLOAD" | jq .
+          echo "::endgroup::"
+
+          echo "::group::Creating pull request via REST API"
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${REPO}/pulls")
+
+          # Split response body and status code
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -1)
+          echo "::endgroup::"
+
+          echo "HTTP Status: $HTTP_STATUS"
+          echo "$HTTP_BODY" | jq .
+
+          echo "## Result Summary" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            PR_URL=$(echo "$HTTP_BODY" | jq -r '.html_url')
+            PR_NUMBER=$(echo "$HTTP_BODY" | jq -r '.number')
+            echo "✅ PR #${PR_NUMBER} created successfully: $PR_URL"
+            echo "PR_URL=$PR_URL" >> "$GITHUB_ENV"
+            echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+            echo "✅ **PR created successfully**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- PR URL: [#${PR_NUMBER}](${PR_URL})" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Referenced issue: #${ISSUE_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            ERROR_MSG=$(echo "$HTTP_BODY" | jq -r '.message // "Unknown error"')
+            echo "❌ PR creation failed (HTTP $HTTP_STATUS): $ERROR_MSG"
+            echo "❌ **PR creation failed** (HTTP $HTTP_STATUS)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            echo "$HTTP_BODY" | jq . >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Verify issue cross-reference via REST API
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ inputs.issue_number }}
+          REPO="${{ github.repository }}"
+
+          echo "::group::Fetching timeline events for issue #${ISSUE_NUMBER}"
+          curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/issues/${ISSUE_NUMBER}/timeline" \
+            | jq '[.[] | select(.event == "cross-referenced") | {event, source_pr: .source.issue.pull_request.html_url}]'
+          echo "::endgroup::"
+
+          echo "::group::Fetching issue #${ISSUE_NUMBER} details"
+          curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/issues/${ISSUE_NUMBER}" \
+            | jq '{title, state, html_url}'
+          echo "::endgroup::"
+
+      - name: Verify PR body contains issue references
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          ISSUE_NUMBER=${{ inputs.issue_number }}
+
+          echo "::group::Fetching created PR body"
+          PR_BODY=$(curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}" \
+            | jq -r '.body')
+          echo "$PR_BODY"
+          echo "::endgroup::"
+
+          echo "## PR Body Verification" >> "$GITHUB_STEP_SUMMARY"
+
+          CHECKS_PASSED=0
+          CHECKS_TOTAL=3
+
+          # Check short-form reference
+          if echo "$PR_BODY" | grep -q "#${ISSUE_NUMBER}"; then
+            echo "✅ Short-form reference (#${ISSUE_NUMBER}) found"
+            echo "- ✅ Short-form reference \`#${ISSUE_NUMBER}\`" >> "$GITHUB_STEP_SUMMARY"
+            CHECKS_PASSED=$((CHECKS_PASSED + 1))
+          else
+            echo "❌ Short-form reference (#${ISSUE_NUMBER}) NOT found"
+            echo "- ❌ Short-form reference \`#${ISSUE_NUMBER}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check full URL reference
+          FULL_URL="https://github.com/${REPO}/issues/${ISSUE_NUMBER}"
+          if echo "$PR_BODY" | grep -q "$FULL_URL"; then
+            echo "✅ Full URL reference found"
+            echo "- ✅ Full URL reference" >> "$GITHUB_STEP_SUMMARY"
+            CHECKS_PASSED=$((CHECKS_PASSED + 1))
+          else
+            echo "❌ Full URL reference NOT found"
+            echo "- ❌ Full URL reference" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check closing keyword reference
+          if echo "$PR_BODY" | grep -qi "closes #${ISSUE_NUMBER}"; then
+            echo "✅ Closing keyword reference found"
+            echo "- ✅ Closing keyword reference" >> "$GITHUB_STEP_SUMMARY"
+            CHECKS_PASSED=$((CHECKS_PASSED + 1))
+          else
+            echo "❌ Closing keyword reference NOT found"
+            echo "- ❌ Closing keyword reference" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo ""
+          echo "Checks passed: ${CHECKS_PASSED}/${CHECKS_TOTAL}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Checks passed: ${CHECKS_PASSED}/${CHECKS_TOTAL}**" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CHECKS_PASSED" -ne "$CHECKS_TOTAL" ]; then
+            echo "::warning::Not all reference checks passed"
+          fi
